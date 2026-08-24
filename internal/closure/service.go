@@ -36,7 +36,6 @@ func (s *Service) CreateAndApply(ctx context.Context, actor domain.Actor, reques
 	}
 	now := s.now().UTC()
 	var applied repository.Closure
-	var compensationPayload string
 	err := s.store.WithTx(ctx, func(tx *repository.Store) error {
 		created, err := tx.CreateClosure(ctx, repository.Closure{VenueID: request.VenueID,
 			StartsAt: request.StartsAt.UTC(), EndsAt: request.EndsAt.UTC(), Reason: request.Reason,
@@ -55,17 +54,15 @@ func (s *Service) CreateAndApply(ctx context.Context, actor domain.Actor, reques
 		if err != nil {
 			return err
 		}
-		compensationPayload = string(payload)
+		if _, err := tx.EnqueueJob(ctx, "closure_compensation", string(payload),
+			fmt.Sprintf("closure:%d:compensate", applied.ID), now, now, s.maxAttempts); err != nil {
+			return err
+		}
 		_, err = tx.AppendAudit(ctx, domain.AuditEvent{ActorID: actor.UserID, ActorRole: actor.Role,
 			Action: "closure.apply", ObjectType: "closure", ObjectID: repository.AuditObjectID(applied.ID),
 			Result: "success", RequestID: actor.RequestID, Metadata: map[string]string{"reason": request.Reason}, CreatedAt: now})
 		return err
 	})
-	if err != nil {
-		return applied, err
-	}
-	_, err = s.store.EnqueueDurableJob(ctx, "closure_compensation", compensationPayload,
-		fmt.Sprintf("closure:%d:compensate", applied.ID), now, now, s.maxAttempts)
 	return applied, err
 }
 
