@@ -211,6 +211,61 @@ func TestCrossVenueRescheduleMovesLedgerAtomically(t *testing.T) {
 	}
 }
 
+func TestCrossVenueRescheduleConflictLeavesCapacityAndLedgerConsistent(t *testing.T) {
+	fixture, closeDB := newBookingFixture(t, 2)
+	defer closeDB()
+	ctx := context.Background()
+
+	// A second slot at a different venue but overlapping the destination's times
+	// so the student cannot hold both; the unique active-student-slot index will
+	// reject the move.
+	destinationVenue, _ := fixture.store.CreateVenue(ctx, domain.Venue{Name: "Destination Venue", District: "East", Timezone: "UTC", Active: true})
+	destination, _ := fixture.store.CreateSlot(ctx, fixtureSlot(destinationVenue.ID, fixture.slot.StartsAt.Add(2*time.Hour), 3))
+	if err := fixture.store.AssignCoach(ctx, fixture.coachID, destination.ID, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Original booking in the source slot.
+	sourceBooking, err := fixture.service.Create(ctx, guardianActor(fixture, "source-create"), CreateRequest{
+		StudentID: fixture.student.ID, GuardianID: fixture.guardian.ID, SlotID: fixture.slot.ID, IdempotencyKey: "source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-existing booking in the destination slot that will block the move.
+	destBooking, err := fixture.service.Create(ctx, guardianActor(fixture, "dest-create"), CreateRequest{
+		StudentID: fixture.student.ID, GuardianID: fixture.guardian.ID, SlotID: destination.ID, IdempotencyKey: "dest",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.service.Reschedule(ctx, guardianActor(fixture, "conflict-move"), sourceBooking.ID, sourceBooking.Version, destination.ID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("Reschedule() error = %v, want ErrConflict", err)
+	}
+
+	source, _ := fixture.store.SlotByID(ctx, fixture.slot.ID)
+	destination, _ = fixture.store.SlotByID(ctx, destination.ID)
+	if source.Reserved != 1 || destination.Reserved != 1 {
+		t.Fatalf("source/destination reserved = %d/%d, want 1/1", source.Reserved, destination.Reserved)
+	}
+	if balance, _ := fixture.store.LedgerBalance(ctx, source.ID); balance != source.Reserved {
+		t.Fatalf("source ledger = %d, reserved = %d", balance, source.Reserved)
+	}
+	if balance, _ := fixture.store.LedgerBalance(ctx, destination.ID); balance != destination.Reserved {
+		t.Fatalf("destination ledger = %d, reserved = %d", balance, destination.Reserved)
+	}
+
+	sourceAfter, _ := fixture.store.BookingByID(ctx, sourceBooking.ID)
+	destAfter, _ := fixture.store.BookingByID(ctx, destBooking.ID)
+	if sourceAfter.Status != domain.BookingHeld || sourceAfter.SlotID != fixture.slot.ID || sourceAfter.Version != sourceBooking.Version {
+		t.Fatalf("source booking mutated = %+v", sourceAfter)
+	}
+	if destAfter.Status != domain.BookingHeld || destAfter.SlotID != destination.ID || destAfter.Version != destBooking.Version {
+		t.Fatalf("destination booking mutated = %+v", destAfter)
+	}
+}
+
 func TestConcurrentBookingDoesNotOversell(t *testing.T) {
 	fixture, closeDB := newBookingFixture(t, 1)
 	defer closeDB()

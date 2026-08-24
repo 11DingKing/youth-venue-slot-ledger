@@ -250,12 +250,8 @@ func (s *Service) Cancel(ctx context.Context, actor domain.Actor, bookingID, ver
 
 func (s *Service) Reschedule(ctx context.Context, actor domain.Actor, bookingID, version, destinationSlotID int64) (domain.Booking, error) {
 	now := s.now().UTC()
-	destination, err := s.reserveRescheduleDestination(ctx, actor, bookingID, version, destinationSlotID, now)
-	if err != nil {
-		return domain.Booking{}, err
-	}
 	var moved domain.Booking
-	err = s.store.WithTx(ctx, func(tx *repository.Store) error {
+	err := s.store.WithTx(ctx, func(tx *repository.Store) error {
 		booking, err := tx.BookingByID(ctx, bookingID)
 		if err != nil {
 			return err
@@ -265,6 +261,41 @@ func (s *Service) Reschedule(ctx context.Context, actor domain.Actor, bookingID,
 		}
 		if booking.Version != version || (booking.Status != domain.BookingHeld && booking.Status != domain.BookingConfirmed) {
 			return domain.ErrInvalidState
+		}
+		student, err := tx.UserByID(ctx, booking.StudentID)
+		if err != nil {
+			return err
+		}
+		authorized, err := tx.HasActiveGuardianAuthorization(ctx, booking.GuardianID, booking.StudentID, now)
+		if err != nil {
+			return err
+		}
+		if !authorized {
+			return domain.ErrGuardianRequired
+		}
+		destination, err := tx.SlotByID(ctx, destinationSlotID)
+		if err != nil {
+			return err
+		}
+		if err := domain.ValidateEligibility(student, destination); err != nil {
+			return err
+		}
+		covered, err := tx.HasCoachCoverage(ctx, destination.ID)
+		if err != nil {
+			return err
+		}
+		if !covered {
+			return domain.ErrCoachCoverage
+		}
+		// Reserve the destination seat inside the same transaction that moves the
+		// booking and writes the ledger. If the move fails (for example because
+		// the student already holds an active booking in the destination slot),
+		// the transaction rolls back and the destination reservation disappears
+		// with it, leaving capacity and the ledger consistent and both original
+		// bookings untouched.
+		destination, err = tx.ReserveSeat(ctx, destination.ID, destination.Version)
+		if err != nil {
+			return err
 		}
 		source, err := tx.SlotByID(ctx, booking.SlotID)
 		if err != nil {
@@ -290,50 +321,6 @@ func (s *Service) Reschedule(ctx context.Context, actor domain.Actor, bookingID,
 		return err
 	})
 	return moved, err
-}
-
-func (s *Service) reserveRescheduleDestination(ctx context.Context, actor domain.Actor, bookingID, version, destinationSlotID int64, now time.Time) (domain.Slot, error) {
-	var destination domain.Slot
-	err := s.store.WithTx(ctx, func(tx *repository.Store) error {
-		booking, err := tx.BookingByID(ctx, bookingID)
-		if err != nil {
-			return err
-		}
-		if actor.Role != domain.RoleOperator && actor.UserID != booking.GuardianID {
-			return domain.ErrForbidden
-		}
-		if booking.Version != version || (booking.Status != domain.BookingHeld && booking.Status != domain.BookingConfirmed) {
-			return domain.ErrInvalidState
-		}
-		student, err := tx.UserByID(ctx, booking.StudentID)
-		if err != nil {
-			return err
-		}
-		authorized, err := tx.HasActiveGuardianAuthorization(ctx, booking.GuardianID, booking.StudentID, now)
-		if err != nil {
-			return err
-		}
-		if !authorized {
-			return domain.ErrGuardianRequired
-		}
-		destination, err = tx.SlotByID(ctx, destinationSlotID)
-		if err != nil {
-			return err
-		}
-		if err := domain.ValidateEligibility(student, destination); err != nil {
-			return err
-		}
-		covered, err := tx.HasCoachCoverage(ctx, destination.ID)
-		if err != nil {
-			return err
-		}
-		if !covered {
-			return domain.ErrCoachCoverage
-		}
-		destination, err = tx.ReserveSeat(ctx, destination.ID, destination.Version)
-		return err
-	})
-	return destination, err
 }
 
 func (s *Service) List(ctx context.Context, actor domain.Actor, status string, limit, offset int) ([]domain.Booking, error) {
