@@ -67,6 +67,57 @@ func TestReopenRestoresSlotsAndRejectsStaleVersion(t *testing.T) {
 	}
 }
 
+func TestReopenLeavesClosureAppliedWhenSlotReopenFailsAndRetriesWithOriginalVersion(t *testing.T) {
+	fixture, closeDB := newClosureFixture(t)
+	defer closeDB()
+	ctx := context.Background()
+	request := CreateRequest{VenueID: fixture.venue.ID, StartsAt: fixture.slot.StartsAt.Add(-time.Minute),
+		EndsAt: fixture.slot.EndsAt.Add(time.Minute), Reason: "power outage"}
+	applied, err := fixture.service.CreateAndApply(ctx, fixture.actor, request)
+	if err != nil {
+		t.Fatalf("CreateAndApply() error: %v", err)
+	}
+	// Simulate the database refusing to reopen the affected slots: run the same
+	// transaction the service now uses, transition the closure record, then fail
+	// the slot-reopen step. Before the fix the transition committed separately,
+	// leaving the closure reopened while the slots stayed closed and making every
+	// retry with the original version fail with ErrVersionConflict.
+	errSlotReopenFailed := errors.New("reopen slots: disk full")
+	txErr := fixture.store.WithTx(ctx, func(tx *repository.Store) error {
+		if _, err := tx.ReopenClosureRecord(ctx, applied.ID, applied.Version, fixture.now); err != nil {
+			return err
+		}
+		return errSlotReopenFailed
+	})
+	if !errors.Is(txErr, errSlotReopenFailed) {
+		t.Fatalf("failed reopen transaction error = %v", txErr)
+	}
+	current, err := fixture.store.ClosureByID(ctx, applied.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != domain.ClosureApplied || current.Version != applied.Version {
+		t.Fatalf("closure after failed reopen = status %s version %d, want %s/%d",
+			current.Status, current.Version, domain.ClosureApplied, applied.Version)
+	}
+	slot, _ := fixture.store.SlotByID(ctx, fixture.slot.ID)
+	if slot.Status != domain.SlotClosed {
+		t.Fatalf("slot status after failed reopen = %s, want %s", slot.Status, domain.SlotClosed)
+	}
+	// After the fault clears, the same original version must still complete the recovery.
+	recovered, err := fixture.service.Reopen(ctx, fixture.actor, applied.ID, applied.Version)
+	if err != nil {
+		t.Fatalf("Reopen() retry error: %v", err)
+	}
+	if recovered.Status != domain.ClosureReopened {
+		t.Fatalf("recovered status = %s, want %s", recovered.Status, domain.ClosureReopened)
+	}
+	slot, _ = fixture.store.SlotByID(ctx, fixture.slot.ID)
+	if slot.Status != domain.SlotOpen {
+		t.Fatalf("slot status after retry = %s, want %s", slot.Status, domain.SlotOpen)
+	}
+}
+
 func TestClosureRequiresOperatorAndValidWindow(t *testing.T) {
 	fixture, closeDB := newClosureFixture(t)
 	defer closeDB()

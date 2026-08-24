@@ -71,16 +71,21 @@ func (s *Service) Reopen(ctx context.Context, actor domain.Actor, id, version in
 		return repository.Closure{}, err
 	}
 	now := s.now().UTC()
-	closure, err := s.store.ClosureByID(ctx, id)
-	if err != nil {
-		return repository.Closure{}, err
-	}
-	reopened, err := s.store.ReopenClosureRecord(ctx, id, version, now)
-	if err != nil {
-		return repository.Closure{}, err
-	}
-	err = s.store.WithTx(ctx, func(tx *repository.Store) error {
-		if _, err := tx.ReopenSlotsForWindow(ctx, closure.VenueID, closure.StartsAt, closure.EndsAt); err != nil {
+	var reopened repository.Closure
+	err := s.store.WithTx(ctx, func(tx *repository.Store) error {
+		// Transition the closure record, reopen the affected slots and append the
+		// audit event inside a single transaction. If reopening the slots fails
+		// (the database rejects the slot update), the rollback must also undo the
+		// closure status transition so the record stays applied at its original
+		// version and the recovery can be retried with the same version once the
+		// fault clears. Keeping these steps in separate transactions left a
+		// half-completed reopen: closure reopened but slots still closed.
+		var err error
+		reopened, err = tx.ReopenClosureRecord(ctx, id, version, now)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ReopenSlotsForWindow(ctx, reopened.VenueID, reopened.StartsAt, reopened.EndsAt); err != nil {
 			return err
 		}
 		_, err = tx.AppendAudit(ctx, domain.AuditEvent{ActorID: actor.UserID, ActorRole: actor.Role,
