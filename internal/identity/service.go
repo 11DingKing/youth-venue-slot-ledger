@@ -50,13 +50,15 @@ func (s *Service) CreateUser(ctx context.Context, actor domain.Actor, request Cr
 		return domain.User{}, err
 	}
 	now := s.now().UTC()
-	created, err := s.store.CreateAccountRecord(ctx, domain.User{Email: request.Email, PasswordHash: passwordHash,
-		Name: request.Name, Role: request.Role, BirthDate: request.BirthDate, AbilityLevel: request.AbilityLevel,
-		Active: true, CreatedAt: now})
-	if err != nil {
-		return domain.User{}, err
-	}
+	var created domain.User
 	err = s.store.WithTx(ctx, func(tx *repository.Store) error {
+		record, err := tx.CreateAccountRecord(ctx, domain.User{Email: request.Email, PasswordHash: passwordHash,
+			Name: request.Name, Role: request.Role, BirthDate: request.BirthDate, AbilityLevel: request.AbilityLevel,
+			Active: true, CreatedAt: now})
+		if err != nil {
+			return err
+		}
+		created = record
 		if request.Role == domain.RoleCoach {
 			if _, err := tx.CreateCoach(ctx, created.ID, request.Qualification); err != nil {
 				return err
@@ -67,7 +69,10 @@ func (s *Service) CreateUser(ctx context.Context, actor domain.Actor, request Cr
 			Result: "success", RequestID: actor.RequestID, Metadata: map[string]string{"role": string(created.Role)}, CreatedAt: now})
 		return err
 	})
-	return created, err
+	if err != nil {
+		return domain.User{}, err
+	}
+	return created, nil
 }
 
 func (s *Service) AuthorizeGuardian(ctx context.Context, actor domain.Actor, authorization domain.GuardianAuthorization) (domain.GuardianAuthorization, error) {
