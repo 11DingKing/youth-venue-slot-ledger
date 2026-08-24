@@ -127,6 +127,74 @@ func TestStoreRejectsNestedTransaction(t *testing.T) {
 	}
 }
 
+// TestLogoutRevocationAndAuditAreAtomic models the logout failure path: revoking
+// the session and appending the logout audit must commit together. If the audit
+// append fails mid-transaction, the revocation rolls back so the token stays
+// active and the caller can retry the same logout once the fault clears.
+func TestLogoutRevocationAndAuditAreAtomic(t *testing.T) {
+	ctx := context.Background()
+	store, db := newTestStore(t)
+	defer db.Close()
+	now := time.Date(2026, time.August, 24, 10, 0, 0, 0, time.UTC)
+
+	user := createUser(t, store, domain.User{Email: "logout-operator@example.test", PasswordHash: "hash",
+		Name: "Operator", Role: domain.RoleOperator, Active: true, CreatedAt: now})
+	session, err := store.CreateSession(ctx, domain.Session{UserID: user.ID, TokenHash: "logout-token-hash",
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now})
+	if err != nil {
+		t.Fatalf("CreateSession() error: %v", err)
+	}
+
+	// Simulate a logout whose audit append fails (here a foreign-key violation on
+	// actor_id, standing in for any transient audit-store fault). Both writes run in
+	// one transaction, so the revocation must roll back alongside the failed audit.
+	txErr := store.WithTx(ctx, func(tx *Store) error {
+		if _, err := tx.RevokeSession(ctx, session.TokenHash, now); err != nil {
+			return err
+		}
+		_, err := tx.AppendAudit(ctx, domain.AuditEvent{
+			ActorID: 999999, ActorRole: user.Role, Action: "session.logout", ObjectType: "session",
+			ObjectID: AuditObjectID(session.ID), Result: "success", RequestID: "logout-failing", CreatedAt: now,
+		})
+		return err
+	})
+	if txErr == nil {
+		t.Fatal("failed audit append did not fail the transaction")
+	}
+
+	// The session survived the rolled-back revocation, so a retry is possible.
+	_, _, err = store.SessionUserByTokenHash(ctx, session.TokenHash, now)
+	if err != nil {
+		t.Fatalf("revoked session survived rollback error = %v, want it still active", err)
+	}
+
+	// The retry now succeeds: revoke and audit commit together.
+	now = now.Add(time.Minute)
+	if err := store.WithTx(ctx, func(tx *Store) error {
+		if _, err := tx.RevokeSession(ctx, session.TokenHash, now); err != nil {
+			return err
+		}
+		_, err := tx.AppendAudit(ctx, domain.AuditEvent{
+			ActorID: user.ID, ActorRole: user.Role, Action: "session.logout", ObjectType: "session",
+			ObjectID: AuditObjectID(session.ID), Result: "success", RequestID: "logout-success", CreatedAt: now,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("retry logout transaction error: %v", err)
+	}
+
+	if _, _, err := store.SessionUserByTokenHash(ctx, session.TokenHash, now); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("retry revoked session error = %v, want ErrNotFound", err)
+	}
+	events, err := store.ListAuditEvents(ctx, "session", AuditObjectID(session.ID), 10, 0)
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error: %v", err)
+	}
+	if len(events) != 1 || events[0].RequestID != "logout-success" {
+		t.Fatalf("audit events = %+v, want single logout-success", events)
+	}
+}
+
 func TestRepositoryReturnsNotFound(t *testing.T) {
 	store, db := newTestStore(t)
 	defer db.Close()

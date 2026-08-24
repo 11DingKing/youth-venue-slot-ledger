@@ -106,19 +106,26 @@ func (s *Service) Logout(ctx context.Context, token string) error {
 	}
 	tokenHash := TokenHash(token)
 	now := s.now().UTC()
-	session, user, err := s.store.RevokeSessionForLogout(ctx, tokenHash, now)
-	if err != nil {
-		return err
-	}
-	_, err = s.store.AppendAudit(ctx, domain.AuditEvent{
-		ActorID: user.ID, ActorRole: user.Role, Action: "session.logout", ObjectType: "session",
-		ObjectID: repository.AuditObjectID(session.ID), Result: "success",
-		RequestID: "logout:" + tokenHash[:12], CreatedAt: now,
+	// Revoke the session and append the logout audit in a single transaction so the
+	// two writes are atomic. If the audit append fails, the revocation rolls back and
+	// the token stays valid, letting the caller retry the same logout once the fault
+	// clears. Without this, a transient audit-store failure would revoke the token
+	// while reporting an error, making the logout impossible to retry.
+	err := s.store.WithTx(ctx, func(tx *repository.Store) error {
+		session, user, err := tx.RevokeSessionForLogout(ctx, tokenHash, now)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.AppendAudit(ctx, domain.AuditEvent{
+			ActorID: user.ID, ActorRole: user.Role, Action: "session.logout", ObjectType: "session",
+			ObjectID: repository.AuditObjectID(session.ID), Result: "success",
+			RequestID: "logout:" + tokenHash[:12], CreatedAt: now,
+		}); err != nil {
+			return fmt.Errorf("record logout audit: %w", err)
+		}
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("record logout audit: %w", err)
-	}
-	return nil
+	return err
 }
 
 func (s *Service) RevokeExpired(ctx context.Context) (int64, error) {
