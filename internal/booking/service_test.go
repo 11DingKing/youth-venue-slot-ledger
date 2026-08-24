@@ -266,6 +266,69 @@ func TestConcurrentBookingDoesNotOversell(t *testing.T) {
 	}
 }
 
+// TestConcurrentSameIdempotencyKeyReplaysFirstResult reproduces the failure
+// path where the idempotency record store faults or races: two callers send
+// the same Idempotency-Key concurrently. The business work and idempotency
+// record commit atomically, so exactly one booking is created and both callers
+// must observe that same booking (one creates, the other replays) without a
+// duplicate-booking conflict or a double seat reservation.
+func TestConcurrentSameIdempotencyKeyReplaysFirstResult(t *testing.T) {
+	fixture, closeDB := newBookingFixture(t, 2)
+	defer closeDB()
+	ctx := context.Background()
+	request := CreateRequest{StudentID: fixture.student.ID, GuardianID: fixture.guardian.ID,
+		SlotID: fixture.slot.ID, IdempotencyKey: "replay-race"}
+	start := make(chan struct{})
+	results := make(chan domain.Booking, 2)
+	errorsFound := make(chan error, 2)
+	var group sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			<-start
+			booking, err := fixture.service.Create(ctx, guardianActor(fixture, fmt.Sprintf("replay-%d", index)), request)
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			results <- booking
+		}(index)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Fatalf("concurrent same-key create error: %v", err)
+	}
+	var first domain.Booking
+	count := 0
+	for booking := range results {
+		if count == 0 {
+			first = booking
+		} else if booking.ID != first.ID {
+			t.Fatalf("replayed booking ID = %d, want %d", booking.ID, first.ID)
+		}
+		count++
+	}
+	if count != 2 {
+		t.Fatalf("observed %d results, want 2", count)
+	}
+	slot, _ := fixture.store.SlotByID(ctx, fixture.slot.ID)
+	if slot.Reserved != 1 {
+		t.Fatalf("same-key concurrent reserved = %d, want 1", slot.Reserved)
+	}
+	balance, _ := fixture.store.LedgerBalance(ctx, slot.ID)
+	if balance != 1 {
+		t.Fatalf("same-key concurrent ledger balance = %d, want 1", balance)
+	}
+	bookings, err := fixture.store.ListBookings(ctx, fixture.guardian.ID, domain.RoleGuardian, "", 10, 0)
+	if err != nil || len(bookings) != 1 {
+		t.Fatalf("bookings persisted for key = %d, want 1", len(bookings))
+	}
+}
+
 func newBookingFixture(t *testing.T, capacity int) (bookingFixture, func()) {
 	t.Helper()
 	ctx := context.Background()

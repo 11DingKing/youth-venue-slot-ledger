@@ -146,20 +146,33 @@ func (s *Service) createOnce(ctx context.Context, actor domain.Actor, request Cr
 		if _, err := tx.AppendAudit(ctx, auditEvent(actor, "booking.create", "booking", created.ID, "success", map[string]string{"status": string(status)}, now)); err != nil {
 			return err
 		}
+		// Persist the idempotency record inside the same transaction so the
+		// business work and the replay log commit atomically: either both
+		// survive or neither does. A concurrent writer that already inserted
+		// the key surfaces as a conflict; we treat that as retryable so the
+		// outer loop re-enters the found branch and replays the first result.
+		if err := tx.SaveIdempotencyRecord(ctx, actor.UserID, "POST", "/v1/bookings", request.IdempotencyKey,
+			requestHash, "booking", created.ID, now.Add(24*time.Hour), now); err != nil {
+			if errors.Is(err, domain.ErrConflict) {
+				return errIdempotencyRace
+			}
+			return err
+		}
 		return nil
 	})
 	if err != nil {
 		return domain.Booking{}, err
 	}
-	if err := s.store.SaveCommittedIdempotencyRecord(ctx, actor.UserID, "POST", "/v1/bookings", request.IdempotencyKey,
-		requestHash, "booking", created.ID, now.Add(24*time.Hour), now); err != nil {
-		return created, err
-	}
 	return created, nil
 }
 
+// errIdempotencyRace marks a concurrent idempotency-key insert that lost the
+// unique race. It is retryable so the createOnce loop re-enters and replays
+// the already-committed result instead of returning a conflict to the caller.
+var errIdempotencyRace = errors.New("idempotency key race")
+
 func retryableContention(err error) bool {
-	if errors.Is(err, domain.ErrVersionConflict) {
+	if errors.Is(err, domain.ErrVersionConflict) || errors.Is(err, errIdempotencyRace) {
 		return true
 	}
 	message := strings.ToLower(err.Error())
